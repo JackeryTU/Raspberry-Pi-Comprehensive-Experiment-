@@ -200,7 +200,7 @@ python3 tools/calibrate_hsv.py
 - 按 `s` 保存到 `calibration_hsv.json`，后续 `camera.py` 自动加载
 - 按 `q/ESC` 退出
 
-> **赛场必做**：赛道光照与实验室差异大，比赛前必须用此工具重新标定阈值。
+> 赛道光照与实验室差异大，比赛前必须用此工具重新标定阈值。
 
 ### 7.2 编码器转角系数标定 (`tools/cal_angle.py`)
 
@@ -246,8 +246,6 @@ cube_car/
     ├── calibrate_hsv.py      # HSV阈值实时校准工具
     └── cal_angle.py          # 编码器转角系数K标定工具
 ```
-
-> **注意**：当前无 `main.py`，主循环直接写在 `state_machine.py` 的调用方（或可由用户按需编写）。
 
 ---
 
