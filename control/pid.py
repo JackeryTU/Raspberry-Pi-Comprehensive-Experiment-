@@ -15,18 +15,19 @@ class PIDController:
 
     参数
     ----
-    Kp, Ki, Kd : PID 增益
-    ideal_speed : 标称目标速度（圈/采样周期），作为 setpoint 基准
+    Kp, Ki, Kd  : PID 增益
+    rated_speed : 标定转速（圈/采样周期 @ base_speed 占空比），作为 setpoint 初始基准。
+                  setpoint 在运行中会由 PIDSpeedLoop 根据实际占空比动态覆盖。
 
     注意：Ki 已隐含固定采样周期 dt（config.py 中的 pid_period），
           若将来改采样周期，需同步调整 Ki。
     """
 
-    def __init__(self, Kp: float, Ki: float, Kd: float, ideal_speed: float):
+    def __init__(self, Kp: float, Ki: float, Kd: float, rated_speed: float):
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
-        self.setpoint = ideal_speed
+        self.setpoint = rated_speed
 
         self._prev_measured: float = 0.0
         self._integral: float = 0.0

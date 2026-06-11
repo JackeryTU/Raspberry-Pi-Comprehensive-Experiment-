@@ -4,6 +4,11 @@
 
 硬件：L298N + 霍尔编码器 + 树莓派 (BCM 编号)
 注意：I1/I4 高电平前进，I2/I3 高电平为反转（刹车用）
+
+v2 更新：
+  • _set_left / _set_right 支持负 duty（反转），用于原地旋转
+  • PIDSpeedLoop 增加 set_raw() 直通模式，原地旋转时绕过 PID
+  • 修复 PID setpoint 指数漂移 bug（用固定标定值 rated_speed 换算）
 """
 
 import os
@@ -73,32 +78,50 @@ def cleanup():
     print("[motor] GPIO 已释放")
 
 
-# ==================== 底层电机控制 ====================
+# ==================== 底层电机控制（支持反转） ====================
 
 def _set_right(duty: float):
-    """设置右轮占空比（正向前进）。duty=0 停止。"""
-    duty = max(0.0, min(100.0, duty))
-    if duty < 0.5:
+    """
+    设置右轮占空比。
+    duty > 0  →  前进（IN1=HIGH, IN2=LOW）
+    duty < 0  →  反转（IN1=LOW, IN2=HIGH）
+    duty ≈ 0  →  停止
+    """
+    duty_abs = abs(duty)
+    if duty_abs < 0.5:
         GPIO.output(PIN_IN1, GPIO.LOW)
         GPIO.output(PIN_IN2, GPIO.LOW)
         _pwm_r.ChangeDutyCycle(0)
-    else:
-        GPIO.output(PIN_IN1, GPIO.HIGH)  # IN1高 / IN2低 → 右轮前进
+    elif duty > 0:
+        GPIO.output(PIN_IN1, GPIO.HIGH)   # 前进
         GPIO.output(PIN_IN2, GPIO.LOW)
-        _pwm_r.ChangeDutyCycle(duty)
+        _pwm_r.ChangeDutyCycle(min(100.0, duty_abs))
+    else:
+        GPIO.output(PIN_IN1, GPIO.LOW)    # 反转
+        GPIO.output(PIN_IN2, GPIO.HIGH)
+        _pwm_r.ChangeDutyCycle(min(100.0, duty_abs))
 
 
 def _set_left(duty: float):
-    """设置左轮占空比（正向前进）。duty=0 停止。"""
-    duty = max(0.0, min(100.0, duty))
-    if duty < 0.5:
+    """
+    设置左轮占空比。
+    duty > 0  →  前进（IN4=HIGH, IN3=LOW）
+    duty < 0  →  反转（IN3=HIGH, IN4=LOW）
+    duty ≈ 0  →  停止
+    """
+    duty_abs = abs(duty)
+    if duty_abs < 0.5:
         GPIO.output(PIN_IN3, GPIO.LOW)
         GPIO.output(PIN_IN4, GPIO.LOW)
         _pwm_l.ChangeDutyCycle(0)
-    else:
-        GPIO.output(PIN_IN4, GPIO.HIGH)  # IN4高 / IN3低 → 左轮前进
+    elif duty > 0:
+        GPIO.output(PIN_IN4, GPIO.HIGH)   # 前进
         GPIO.output(PIN_IN3, GPIO.LOW)
-        _pwm_l.ChangeDutyCycle(duty)
+        _pwm_l.ChangeDutyCycle(min(100.0, duty_abs))
+    else:
+        GPIO.output(PIN_IN3, GPIO.HIGH)   # 反转
+        GPIO.output(PIN_IN4, GPIO.LOW)
+        _pwm_l.ChangeDutyCycle(min(100.0, duty_abs))
 
 
 # ==================== 高层差速接口 ====================
@@ -158,8 +181,8 @@ def brake(duration: float = 0.1):
     GPIO.output(PIN_IN1, GPIO.LOW)
     GPIO.output(PIN_IN2, GPIO.HIGH)
     # 左轮：前进是 IN4=HIGH/IN3=LOW，制动反转（原版此处有 bug，已修正）
-    GPIO.output(PIN_IN3, GPIO.HIGH)   # ← 原版错误：此处为 LOW，与前进相同
-    GPIO.output(PIN_IN4, GPIO.LOW)    # ← 原版错误：此处为 HIGH，与前进相同
+    GPIO.output(PIN_IN3, GPIO.HIGH)
+    GPIO.output(PIN_IN4, GPIO.LOW)
     _pwm_r.ChangeDutyCycle(50)
     _pwm_l.ChangeDutyCycle(50)
     time.sleep(duration)
@@ -171,6 +194,10 @@ def brake(duration: float = 0.1):
 class PIDSpeedLoop:
     """
     双轮 PID 速度闭环，以独立线程定时运行。
+
+    v2 更新：
+      • set_raw() — 直通模式，绕过 PID 直接设置两轮 duty（用于原地旋转）
+      • 修复 setpoint 指数漂移：固定标定转速 rated_speed 作为换算基准
     """
 
     PULSES_PER_REV = 585
@@ -178,8 +205,10 @@ class PIDSpeedLoop:
     def __init__(self):
         cfg_l = MOTOR['pid_left']
         cfg_r = MOTOR['pid_right']
-        self._pid_l = PIDController(**cfg_l)
-        self._pid_r = PIDController(**cfg_r)
+        self._pid_l = PIDController(Kp=cfg_l['Kp'], Ki=cfg_l['Ki'], Kd=cfg_l['Kd'],
+                                     rated_speed=MOTOR['rated_speed_l'])
+        self._pid_r = PIDController(Kp=cfg_r['Kp'], Ki=cfg_r['Ki'], Kd=cfg_r['Kd'],
+                                     rated_speed=MOTOR['rated_speed_r'])
         self._period = MOTOR['pid_period']
 
         self._target_speed: float = 0.0
@@ -191,11 +220,34 @@ class PIDSpeedLoop:
         self._last_r = 0
         self._last_l = 0
 
+        # ★ 保存标定转速作为 setpoint 计算基准
+        #   修复：原代码用 self._pid.setpoint（会被指数级污染）
+        self._rated_speed_l = MOTOR['rated_speed_l']
+        self._rated_speed_r = MOTOR['rated_speed_r']
+
+        # 直通模式（原地旋转时绕过 PID）
+        self._passthrough = False
+        self._raw_left:  float = 0.0
+        self._raw_right: float = 0.0
+
     def set_target(self, speed: float, turn_bias: float = 0.0):
+        """PID 闭环控制（正常行驶）。"""
         turn_bias = max(-1.0, min(1.0, turn_bias))
         with self._lock:
+            self._passthrough = False
             self._target_speed = speed
             self._turn_bias    = turn_bias
+
+    def set_raw(self, left_duty: float, right_duty: float):
+        """
+        直通模式：绕过 PID，直接设置两轮占空比。
+        用于原地旋转（一正一反）或精确刹车。
+        正值 = 前进，负值 = 反转。
+        """
+        with self._lock:
+            self._passthrough = True
+            self._raw_left  = left_duty
+            self._raw_right = right_duty
 
     def start(self):
         global _loop_active
@@ -232,26 +284,63 @@ class PIDSpeedLoop:
             self._last_r = cur_r
             self._last_l = cur_l
 
-            speed_r = delta_r / self.PULSES_PER_REV
-            speed_l = delta_l / self.PULSES_PER_REV
-
+            # ── 读取当前控制模式（快进快出，不在锁内sleep）──
             with self._lock:
+                passthrough = self._passthrough
+                raw_left    = self._raw_left
+                raw_right   = self._raw_right
                 base = self._target_speed
                 bias = self._turn_bias
 
-            if base < 0.5:
-                stop()
-                time.sleep(self._period)
+            # ── 直通模式：直接输出 raw duty（原地旋转 / 倒车）──
+            if passthrough:
+                _set_left(raw_left)
+                _set_right(raw_right)
+                elapsed = time.monotonic() - t0
+                sleep_t = self._period - elapsed
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
                 continue
 
-            base_ideal_l = self._pid_l.setpoint
-            base_ideal_r = self._pid_r.setpoint
+            # ── 停止：|base| 极小 ──
+            if abs(base) < 0.5:
+                stop()
+                elapsed = time.monotonic() - t0
+                sleep_t = self._period - elapsed
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                continue
+
+            # ── 倒车：编码器不区分方向，无法 PID 闭环，用直通方式输出负占空比 ──
+            if base < 0:
+                rev_base = abs(base)
+                # turn_bias 方向含义在倒车时保持一致：
+                #   bias>0 → 右侧慢（右转）→ 倒车时左轮更负
+                factor_l = max(min_duty / 100.0, 1.0 + bias * turn_rate)
+                factor_r = max(min_duty / 100.0, 1.0 - bias * turn_rate)
+                out_l = -rev_base * factor_l
+                out_r = -rev_base * factor_r
+                # 钳制到 [-100, -min_duty]
+                out_l = max(-100.0, min(-min_duty, out_l))
+                out_r = max(-100.0, min(-min_duty, out_r))
+                _set_left(out_l)
+                _set_right(out_r)
+                elapsed = time.monotonic() - t0
+                sleep_t = self._period - elapsed
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                continue
+
+            # ── 前进：PID 闭环 ──
+            speed_r = delta_r / self.PULSES_PER_REV
+            speed_l = delta_l / self.PULSES_PER_REV
 
             factor_l = max(min_duty / 100.0, 1.0 + bias * turn_rate)
             factor_r = max(min_duty / 100.0, 1.0 - bias * turn_rate)
 
-            self._pid_l.setpoint = base_ideal_l * factor_l * (base / MOTOR['base_speed'])
-            self._pid_r.setpoint = base_ideal_r * factor_r * (base / MOTOR['base_speed'])
+            # ★ 占空比→转速换算：rated_speed × 转向因子 × (实际占空比/基准占空比)
+            self._pid_l.setpoint = self._rated_speed_l * factor_l * (base / MOTOR['base_speed'])
+            self._pid_r.setpoint = self._rated_speed_r * factor_r * (base / MOTOR['base_speed'])
 
             ff_l = base * factor_l
             ff_r = base * factor_r
