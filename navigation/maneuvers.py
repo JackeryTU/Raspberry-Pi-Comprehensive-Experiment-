@@ -1,20 +1,27 @@
 """
 navigation/maneuvers.py
-黄色和绿色魔方机动动作序列
+黄色和绿色魔方机动动作序列（v3）
 
-说明
-----
-• 黄/绿魔方通过动作被拆分为 3 个 ManeuverStep，按 step_idx 顺序被状态机消费：
-    index 0  phase='align'   — 切向转向阶段（ALIGN 状态使用）
-    index 1  phase='pass'    — 侧身通过阶段（PASS  状态使用）
-    index 2  phase='recover' — 回正阶段（RECOVER 状态使用）
+策略：原地旋转式通过
+  步骤序列：approach → stop → rotate1(±angle) → straight → rotate2(∓angle) → straight
 
-• 红色魔方绕行（360°逆时针）逻辑复杂，全部在 state_machine.py 中直接实现，
-  此处不再提供红色动作序列。
+  黄色（从左侧通过）：
+    1. approach  — 距离PID接近到 stop_distance
+    2. stop      — 停车 0.3s
+    3. rotate1   — 原地左转（右进左退），角度 = yellow_rotate1_angle
+    4. straight  — 直行通过 yellow_pass_dist cm（编码器判定）
+    5. rotate2   — 原地右转回正（左进右退），角度 = yellow_rotate2_angle
+    6. straight  — 短距恢复 recover_straight_dist cm（编码器判定）
 
-• 每个状态机只从 MANEUVER_TABLE 按颜色取出对应列表后，在对应的
-  ALIGN / PASS / RECOVER 状态中依次读取 steps[step_idx]，执行完毕后
-  推进 step_idx 并切换状态。详见 state_machine.py 的 _complete_step()。
+  绿色（从右侧通过）：
+    1. approach  — 距离PID接近到 stop_distance
+    2. stop      — 停车 0.3s
+    3. rotate1   — 原地右转（左进右退），角度 = green_rotate1_angle
+    4. straight  — 直行通过 green_pass_dist cm（编码器判定）
+    5. rotate2   — 原地左转回正（右进左退），角度 = green_rotate2_angle
+    6. straight  — 短距恢复 recover_straight_dist cm（编码器判定）
+
+红色魔方绕行逻辑不变，仍在 state_machine.py 中直接实现。
 """
 
 from config import MANEUVER
@@ -22,57 +29,110 @@ from config import MANEUVER
 
 class ManeuverStep:
     """
-    单段机动定义。
+    单段机动定义（v3）。
 
     属性
     ----
-    phase     : 对应的状态机阶段 ('align' | 'pass' | 'recover')
-    speed     : 目标速度占空比（直接用于 PIDSpeedLoop.set_target）
-    turn_bias : 转向偏置 (-1~1)，已含方向符号
-    timeout   : 本段最大持续时间（秒）
-    desc      : 调试描述
+    action         : 'approach' | 'stop' | 'rotate' | 'straight'
+    speed          : 基准占空比 (0-100)
+    turn_bias      : 旋转方向符号
+                     rotate 时：+1 = 右转/CW（左轮前进，右轮反转）
+                               -1 = 左转/CCW（右轮前进，左轮反转）
+                     approach/straight 时：通常为 0（直行）
+    target_angle   : rotate 时的目标角度（度），编码器脉冲之和判定
+    target_distance: approach/straight 时的目标距离（cm）
+                     approach：超声波判定（到魔方的距离）
+                     straight：编码器判定（行驶距离）
+                     0 = 不使用距离判定
+    timeout        : 本段最大持续时间（秒），保底退出
+    desc           : 调试描述
     """
 
-    __slots__ = ('phase', 'speed', 'turn_bias', 'timeout', 'desc')
+    __slots__ = ('action', 'speed', 'turn_bias', 'target_angle',
+                 'target_distance', 'timeout', 'desc')
 
-    def __init__(self, phase, speed, turn_bias, timeout, desc=""):
-        self.phase     = phase
-        self.speed     = speed
-        self.turn_bias = turn_bias
-        self.timeout   = timeout
-        self.desc      = desc
+    def __init__(self, action, speed=0, turn_bias=0, target_angle=0,
+                 target_distance=0, timeout=1.0, desc=""):
+        self.action         = action
+        self.speed          = speed
+        self.turn_bias      = turn_bias
+        self.target_angle   = target_angle
+        self.target_distance = target_distance
+        self.timeout        = timeout
+        self.desc           = desc
 
     def __repr__(self):
-        return (f"ManeuverStep(phase={self.phase!r}, speed={self.speed}, "
-                f"turn_bias={self.turn_bias:+.2f}, timeout={self.timeout}s)")
+        parts = [f"action={self.action!r}"]
+        if self.speed:
+            parts.append(f"speed={self.speed}")
+        if self.turn_bias:
+            parts.append(f"turn_bias={self.turn_bias:+.0f}")
+        if self.target_angle:
+            parts.append(f"target_angle={self.target_angle}°")
+        if self.target_distance:
+            parts.append(f"target_distance={self.target_distance}cm")
+        parts.append(f"timeout={self.timeout}s")
+        return f"ManeuverStep({', '.join(parts)})"
 
 
 def build_yellow():
     """
     黄色魔方：从左侧通过。
-    左转切向 → 左侧侧身直行 → 右转回正。
+    approach → stop → rotate1(左转) → straight → rotate2(右转回正) → straight → straight(清离)
     """
     return [
         ManeuverStep(
-            phase='align',
-            speed=MANEUVER['align_speed'],
-            turn_bias=-MANEUVER['align_turn'],   # 负 = 左转
-            timeout=MANEUVER['align_time'],
-            desc="黄:左转切向"
+            action='approach',
+            speed=MANEUVER['approach_speed_yg'],
+            turn_bias=0,
+            target_distance=MANEUVER['stop_distance'],
+            timeout=MANEUVER['approach_timeout'],
+            desc="黄:距离PID接近"
         ),
         ManeuverStep(
-            phase='pass',
-            speed=MANEUVER['pass_speed'],
-            turn_bias=-MANEUVER['pass_turn'],    # 轻微左转保持间距
-            timeout=MANEUVER['pass_time'],
-            desc="黄:左侧通过"
+            action='stop',
+            timeout=MANEUVER['stop_time'],
+            desc="黄:停车"
         ),
         ManeuverStep(
-            phase='recover',
-            speed=MANEUVER['recover_speed'],
-            turn_bias=+MANEUVER['recover_turn'], # 右转回正
-            timeout=MANEUVER['recover_time'],
-            desc="黄:右转回正"
+            action='rotate',
+            speed=MANEUVER['yellow_rotate1_speed'],
+            turn_bias=-1,                                   # -1 = 左转（右进左退）
+            target_angle=MANEUVER['yellow_rotate1_angle'],
+            timeout=MANEUVER['rotate_timeout'],
+            desc="黄:原地左转"
+        ),
+        ManeuverStep(
+            action='straight',
+            speed=MANEUVER['yellow_pass_speed'],
+            turn_bias=0,
+            target_distance=MANEUVER['yellow_pass_dist'],
+            timeout=MANEUVER['yellow_pass_time'],
+            desc="黄:直行通过(左侧)"
+        ),
+        ManeuverStep(
+            action='rotate',
+            speed=MANEUVER['yellow_rotate2_speed'],
+            turn_bias=+1,                                   # +1 = 右转（左进右退）
+            target_angle=MANEUVER['yellow_rotate2_angle'],
+            timeout=MANEUVER['rotate_timeout'],
+            desc="黄:原地右转回正"
+        ),
+        ManeuverStep(
+            action='straight',
+            speed=MANEUVER['yellow_pass_speed'],
+            turn_bias=0,
+            target_distance=MANEUVER['recover_straight_dist'],
+            timeout=1.0,
+            desc="黄:直行恢复"
+        ),
+        ManeuverStep(
+            action='straight',
+            speed=MANEUVER['yellow_pass_speed'],
+            turn_bias=0,
+            target_distance=0,                                   # 0=纯时间判定
+            timeout=MANEUVER['post_maneuver_straight_time'],
+            desc="黄:通过后直行清离"
         ),
     ]
 
@@ -80,29 +140,61 @@ def build_yellow():
 def build_green():
     """
     绿色魔方：从右侧通过。
-    右转切向 → 右侧侧身直行 → 左转回正。
+    approach → stop → rotate1(右转) → straight → rotate2(左转回正) → straight → straight(清离)
     """
     return [
         ManeuverStep(
-            phase='align',
-            speed=MANEUVER['align_speed'],
-            turn_bias=+MANEUVER['align_turn'],   # 正 = 右转
-            timeout=MANEUVER['align_time'],
-            desc="绿:右转切向"
+            action='approach',
+            speed=MANEUVER['approach_speed_yg'],
+            turn_bias=0,
+            target_distance=MANEUVER['stop_distance'],
+            timeout=MANEUVER['approach_timeout'],
+            desc="绿:距离PID接近"
         ),
         ManeuverStep(
-            phase='pass',
-            speed=MANEUVER['pass_speed'],
-            turn_bias=+MANEUVER['pass_turn'],    # 轻微右转保持间距
-            timeout=MANEUVER['pass_time'],
-            desc="绿:右侧通过"
+            action='stop',
+            timeout=MANEUVER['stop_time'],
+            desc="绿:停车"
         ),
         ManeuverStep(
-            phase='recover',
-            speed=MANEUVER['recover_speed'],
-            turn_bias=-MANEUVER['recover_turn'], # 左转回正
-            timeout=MANEUVER['recover_time'],
-            desc="绿:左转回正"
+            action='rotate',
+            speed=MANEUVER['green_rotate1_speed'],
+            turn_bias=+1,                                   # +1 = 右转（左进右退）
+            target_angle=MANEUVER['green_rotate1_angle'],
+            timeout=MANEUVER['rotate_timeout'],
+            desc="绿:原地右转"
+        ),
+        ManeuverStep(
+            action='straight',
+            speed=MANEUVER['green_pass_speed'],
+            turn_bias=0,
+            target_distance=MANEUVER['green_pass_dist'],
+            timeout=MANEUVER['green_pass_time'],
+            desc="绿:直行通过(右侧)"
+        ),
+        ManeuverStep(
+            action='rotate',
+            speed=MANEUVER['green_rotate2_speed'],
+            turn_bias=-1,                                   # -1 = 左转（右进左退）
+            target_angle=MANEUVER['green_rotate2_angle'],
+            timeout=MANEUVER['rotate_timeout'],
+            desc="绿:原地左转回正"
+        ),
+        ManeuverStep(
+            action='straight',
+            speed=MANEUVER['green_pass_speed'],
+            turn_bias=0,
+            target_distance=MANEUVER['recover_straight_dist'],
+            timeout=1.0,
+            desc="绿:直行恢复"
+        ),
+        ManeuverStep(
+            action='straight',
+            speed=MANEUVER['green_pass_speed'],
+            turn_bias=0,
+            target_distance=0,                                   # 0=纯时间判定
+            timeout=MANEUVER['post_maneuver_straight_time'],
+            desc="绿:通过后直行清离"
         ),
     ]
 

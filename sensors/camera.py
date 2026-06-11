@@ -12,10 +12,23 @@ sensors/camera.py
 7. 彻底禁用 OpenCV / GStreamer 运行时警告
 """
 
-# ========== 警告抑制：必须在 import cv2 之前 ==========
+# ========== 警告抑制：必须在任何 import 之前 ==========
 import os
-os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'      # OpenCV 4.5+
-os.environ['GST_DEBUG'] = '0'                  # GStreamer 静默
+import sys
+import ctypes
+
+# ---- 终极方案：重定向 C 级别的 stderr 到 /dev/null ----
+# libjpeg 直接写文件描述符 2，绕过 Python 的 sys.stderr
+libc = ctypes.CDLL(None)
+devnull = os.open('/dev/null', os.O_WRONLY)
+libc.dup2(devnull, 2)  # 将 fd 2 (stderr) 重定向到 /dev/null
+os.close(devnull)
+# 注意：此后所有 C 库的 stderr 输出（包括 libjpeg）都会被丢弃
+# -----------------------------------------------------
+
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+os.environ['GST_DEBUG'] = '0'
+
 import warnings
 warnings.filterwarnings('ignore')
 # ======================================================
